@@ -14,7 +14,7 @@ import (
 
 var (
 	calls        map[string]bool // The bool value is true for a call and false for a conference.
-	switchToConf chan bool
+	switchToConf map[string]chan bool
 	timeout      int64
 )
 
@@ -78,7 +78,7 @@ func callBridgeHandler(cl ari.Client, bh *ari.BridgeHandle, channelIDs *[]string
 
 	for {
 		select {
-		case <-switchToConf:
+		case <-switchToConf[bh.ID()]:
 			go confBridgeHandler(cl, bh)
 			return
 		case e := <-chanEnteredBridge.Events():
@@ -87,6 +87,7 @@ func callBridgeHandler(cl ari.Client, bh *ari.BridgeHandle, channelIDs *[]string
 			_, ok := calls[bh.ID()]
 			if !ok && numOfChans == 2 {
 				calls[bh.ID()] = true
+				switchToConf[bh.ID()] = make(chan bool)
 			}
 		case e := <-chanLeftBridge.Events():
 			v := e.(*ari.ChannelLeftBridge)
@@ -106,6 +107,7 @@ func callBridgeHandler(cl ari.Client, bh *ari.BridgeHandle, channelIDs *[]string
 				cl.Channel().Hangup(v.Keys()[len(v.Keys())-1], "normal")
 			}
 			delete(calls, v.Bridge.ID)
+			delete(switchToConf, v.Bridge.ID)
 			bh.Delete()
 			return
 		}
@@ -126,12 +128,14 @@ func confBridgeHandler(cl ari.Client, bh *ari.BridgeHandle) {
 			_, ok := calls[bh.ID()]
 			if !ok && numOfChans == 1 {
 				calls[bh.ID()] = false
+				switchToConf[bh.ID()] = make(chan bool)
 			}
 		case e := <-chanLeftBridge.Events():
 			v := e.(*ari.ChannelLeftBridge)
 			cl.Channel().Hangup(v.Channel.Key, "normal")
 			if len(v.Bridge.ChannelIDs) == 0 {
 				delete(calls, v.Bridge.ID)
+				delete(switchToConf, v.Bridge.ID)
 				bh.Delete()
 				return
 			}
@@ -206,17 +210,16 @@ func createCall(cl ari.Client, ext string) (h *ari.ChannelHandle, err error) {
 }
 
 func dial(extens []string, cl ari.Client) {
-	key := ari.NewKey("", createBridgeID())
-	bh, err := cl.Bridge().Create(key, "mixing", key.ID)
-	exitOnErr(err)
-
 	for _, ext := range extens {
 		if !checkEndpointStatus("PJSIP", ext, cl) {
 			fmt.Println(" << Cannot dial endpoint " + ext + ". Please try again.")
-			bh.Delete()
 			return
 		}
 	}
+
+	key := ari.NewKey("", createBridgeID())
+	bh, err := cl.Bridge().Create(key, "mixing", key.ID)
+	exitOnErr(err)
 
 	channelIDs := make([]string, 0)
 	if len(extens) > 2 {
@@ -244,7 +247,7 @@ func listCalls(cl ari.Client) {
 	}
 
 	for i, _ := range calls {
-		exts, _ := getBridgeParticipants(i, cl)
+		exts := getBridgeParticipants(i, cl)
 		fmt.Print(" << ", i, ": ")
 		for _, v := range exts {
 			fmt.Print(v, " ")
@@ -273,7 +276,7 @@ func joinCall(callID string, extens []string, cl ari.Client) {
 	}
 
 	if calls[callID] {
-		switchToConf <- true
+		switchToConf[callID] <- true 
 		calls[callID] = false
 	}
 
@@ -291,7 +294,7 @@ func joinCall(callID string, extens []string, cl ari.Client) {
 	return
 }
 
-func getBridgeParticipants(callID string, cl ari.Client) ([]string, int) {
+func getBridgeParticipants(callID string, cl ari.Client) []string {
 	bh := cl.Bridge().Get(ari.NewKey("", callID))
 	data, err := bh.Data()
 	exitOnErr(err)
@@ -302,11 +305,11 @@ func getBridgeParticipants(callID string, cl ari.Client) ([]string, int) {
 		exitOnErr(err)
 		participants = append(participants, data.Accountcode)
 	}
-	return participants, len(participants)
+	return participants
 }
 
 func checkEndpointStatus(tech string, resource string, cl ari.Client) bool {
-	data, _ := cl.Endpoint().Data(ari.NewEndpointKey("PJSIP", resource))
+	data, _ := cl.Endpoint().Data(ari.NewEndpointKey(tech, resource))
 	if data != nil && data.State == "online" {
 		return true
 	} else {
@@ -329,7 +332,7 @@ func logErr(err error) {
 
 func main() {
 	calls = make(map[string]bool)
-	switchToConf = make(chan bool)
+	switchToConf = make(map[string]chan bool)
 	timeout = 30e9
 	cl, err := native.Connect(&native.Options{
 		Application:  stasisApp,
